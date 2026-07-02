@@ -92,7 +92,11 @@ class CrossSectionalBacktest:
                 breaker_tripped = self.risk_stack.check_circuit_breaker(state, equity)
                 if breaker_tripped and current_book is not None:
                     equity = self._flatten_book(current_book, entry_prices, current_prices,
-                                                 equity, book_notional_at_entry, fee_frac)
+                                                equity, book_notional_at_entry, fee_frac)
+                    rebalance_log.append(RebalanceRecord(
+                        timestamp=ts, longs=current_book.longs, shorts=current_book.shorts,
+                        book_pnl_pct=book_pnl_pct, flattened_by_profit_lock=False,
+                        flattened_by_circuit_breaker=True))
                     current_book = None
                     state.flattened_until_next_rebalance = True
 
@@ -117,47 +121,46 @@ class CrossSectionalBacktest:
 
             is_due = self.strategy.is_rebalance_due(last_rebalance_idx, idx)
             if is_due:
-                new_book = self.strategy.build_target_book(
-                    ts, price_panel, idx, ml_selector=self.ml_selector
-                )
-
-                if current_book is not None and current_book.weights:
-                    equity = self._flatten_book(current_book, entry_prices, current_prices,
-                                                 equity, book_notional_at_entry, fee_frac)
-                    rebalance_log.append(RebalanceRecord(
-                        timestamp=ts, longs=current_book.longs, shorts=current_book.shorts,
-                        book_pnl_pct=book_pnl_pct, flattened_by_profit_lock=False))
-
-                self.risk_stack.reset_for_new_rebalance(state)
-                state.flattened_until_next_rebalance = False
-                last_rebalance_idx = idx
-
-                if new_book.weights:
-                    vol_scalar = self.risk_stack.volatility_scalar(book_return_history) if self.cfg.use_risk_stack else 1.0
-                    gross_notional = equity * p.base_leverage * vol_scalar
-                    entry_prices = {sym: current_prices[sym] for sym in new_book.weights}
-                    entry_fee = sum(abs(w) * gross_notional * fee_frac for w in new_book.weights.values())
-                    equity -= entry_fee
-                    book_notional_at_entry = gross_notional
-
-                    self.risk_stack.register_legs(state, new_book.weights, entry_prices)
-
-                    # register ML training labels for this rebalance's legs,
-                    # resolved `rebalance_hours` bars later
-                    if self.ml_selector.cfg.enabled:
-                        feat_df = self.ml_selector.compute_features(price_panel, idx, p.universe)
-                        for sym, w in new_book.weights.items():
-                            if sym in feat_df.index:
-                                self.ml_selector.register_pending(
-                                    rebalance_idx=idx,
-                                    resolve_idx=idx + p.rebalance_hours,
-                                    symbol=sym,
-                                    side="long" if w > 0 else "short",
-                                    features=feat_df.loc[sym].to_dict(),
-                                )
-                    current_book = new_book
+                if state.circuit_breaker_tripped:
+                    # Breaker is tripped and has not been manually reset -- do NOT
+                    # open new exposure. Skip this rebalance entirely and keep waiting.
+                    logger.warning(f"Rebalance skipped at {ts}: circuit breaker active, "
+                                    f"awaiting manual reset.")
+                    last_rebalance_idx = idx  # still advance schedule so it doesn't fire every bar
                 else:
-                    current_book = None
+                    new_book = self.strategy.build_target_book(
+                        ts, price_panel, idx, ml_selector=self.ml_selector
+                    )
+                    if current_book is not None and current_book.weights:
+                        equity = self._flatten_book(current_book, entry_prices, current_prices,
+                                                    equity, book_notional_at_entry, fee_frac)
+                        rebalance_log.append(RebalanceRecord(
+                            timestamp=ts, longs=current_book.longs, shorts=current_book.shorts,
+                            book_pnl_pct=book_pnl_pct, flattened_by_profit_lock=False))
+
+                    self.risk_stack.reset_for_new_rebalance(state)
+                    state.flattened_until_next_rebalance = False
+                    last_rebalance_idx = idx
+
+                    if new_book.weights:
+                        vol_scalar = self.risk_stack.volatility_scalar(book_return_history) if self.cfg.use_risk_stack else 1.0
+                        gross_notional = equity * p.base_leverage * vol_scalar
+                        entry_prices = {sym: current_prices[sym] for sym in new_book.weights}
+                        entry_fee = sum(abs(w) * gross_notional * fee_frac for w in new_book.weights.values())
+                        equity -= entry_fee
+                        book_notional_at_entry = gross_notional
+                        self.risk_stack.register_legs(state, new_book.weights, entry_prices)
+                        if self.ml_selector.cfg.enabled:
+                            feat_df = self.ml_selector.compute_features(price_panel, idx, p.universe)
+                            for sym, w in new_book.weights.items():
+                                if sym in feat_df.index:
+                                    self.ml_selector.register_pending(
+                                        rebalance_idx=idx, resolve_idx=idx + p.rebalance_hours,
+                                        symbol=sym, side="long" if w > 0 else "short",
+                                        features=feat_df.loc[sym].to_dict())
+                        current_book = new_book
+                    else:
+                        current_book = None
 
             equity_curve.append({'timestamp': ts, 'equity': equity})
 
@@ -191,7 +194,7 @@ class CrossSectionalBacktest:
             logger.warning(f"Per-leg disaster stop hit: {sym} at {cp} (entry {ep})")
         return equity + pnl - fees
 
-    def _summarize(self, equity_curve, rebalance_log):
+    def _summarize(self, equity_curve, rebalance_log, price_panel, start_idx, p):
         eq_df = pd.DataFrame(equity_curve)
         if eq_df.empty:
             return {'error': 'no bars processed'}
@@ -204,10 +207,29 @@ class CrossSectionalBacktest:
         sharpe = float(returns.mean() / returns.std() * np.sqrt(24 * 365)) if returns.std() > 0 else 0.0
         net_return = float(eq_df['equity'].iloc[-1] / eq_df['equity'].iloc[0] - 1.0)
 
+        n_bars_tradeable = len(price_panel) - start_idx
+        expected_rebalances = int(n_bars_tradeable / p.rebalance_hours)
+        n_breaker_flattens = sum(1 for r in rebalance_log if r.flattened_by_circuit_breaker)
+        n_profit_lock_flattens = sum(1 for r in rebalance_log if r.flattened_by_profit_lock)
+        n_normal_rebalances = len(rebalance_log) - n_breaker_flattens - n_profit_lock_flattens
+
+        logger.info(f"Expected rebalances: ~{expected_rebalances} | "
+                    f"Logged events: {len(rebalance_log)} "
+                    f"(normal={n_normal_rebalances}, profit_lock={n_profit_lock_flattens}, "
+                    f"circuit_breaker={n_breaker_flattens})")
+        if n_breaker_flattens > 0:
+            logger.warning(f"Circuit breaker tripped {n_breaker_flattens}x during this run and "
+                            f"required manual reset each time -- book was likely flat for extended "
+                            f"periods. Do not compare Sharpe/return directly to a run with 0 trips.")
+
         return {
             'equity_curve': eq_df[['timestamp', 'equity', 'drawdown']],
             'rebalances': rebalance_log,
             'n_rebalances': len(rebalance_log),
+            'n_normal_rebalances': n_normal_rebalances,
+            'n_profit_lock_flattens': n_profit_lock_flattens,
+            'n_circuit_breaker_flattens': n_breaker_flattens,
+            'expected_rebalances': expected_rebalances,
             'net_return': net_return,
             'max_drawdown': max_dd,
             'sharpe': sharpe,
