@@ -38,6 +38,7 @@ class RebalanceRecord:
     shorts: List[str]
     book_pnl_pct: float
     flattened_by_profit_lock: bool
+    flattened_by_circuit_breaker: bool = False
     legs_stopped: List[str] = field(default_factory=list)
 
 
